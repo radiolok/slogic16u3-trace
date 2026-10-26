@@ -1,0 +1,19 @@
+# build output
+build/
+__pycache__/
+*.elf
+*.log
+
+# simulation
+*.vvp
+*.vcd
+*.fst
+rtl/sim/stream.hex
+rtl/sim/tpiu_words.hex
+
+# veryl build: generated SystemVerilog lives next to the sources
+rtl/usb/usb3/Veryl.lock
+rtl/usb/usb3/dependencies/
+
+# captures and flash dumps
+*.bin

@@ -1,0 +1,41 @@
+name: ci
+
+# Lint, testbenches and decoder tests. The FPGA image itself needs Gowin EDA and is built locally (rtl/build.sh).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    env:
+      VERYL_VERSION: v0.22.0
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: YosysHQ/setup-oss-cad-suite@v4
+        with:
+          version: '2026-10-20'   # the release the RTL is linted with locally
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Veryl
+        run: |
+          curl -sSfL -o veryl.zip \
+            https://github.com/veryl-lang/veryl/releases/download/$VERYL_VERSION/veryl-x86_64-linux.zip
+          mkdir -p "$HOME/.local/bin" && unzip -o -q veryl.zip -d "$HOME/.local/bin" && rm veryl.zip
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/veryl" --version
+
+      - name: Lint (Verilator -Wall)
+        run: OSS=$(dirname "$(command -v verilator)") sh rtl/sim/lint.sh
+
+      - name: Testbenches (iverilog)
+        run: OSS=$(dirname "$(command -v iverilog)") sh rtl/sim/run.sh
+
+      - name: Decoder tests
+        run: python3 -m unittest discover -v tools/test
+
+      - name: Python syntax
+        run: python3 -m py_compile tools/*.py tools/debug/*.py tools/targets/*/*.py

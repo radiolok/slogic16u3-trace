@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1300 620" width="1300" height="620" font-family="'Segoe UI','DejaVu Sans',Helvetica,Arial,sans-serif" role="img" aria-labelledby="t d">
+<title id="t">slogic16u3-trace: how it works</title>
+<desc id="d">Target trace (TRACECLK and TRACED0..3) enters SLogic16U3 inputs CH8..CH12, is captured by IDDR in the GW5AT-15 FPGA, passes two FIFOs into EP1 IN of the USB 3.0 stack and goes to the PC. The image is written to the analyzer's flash over USB through the factory DFU loader. A MIPI20 adapter with JTAG buffers is the next step.</desc>
+<defs>
+  <marker id="ao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#E8590C"/></marker>
+  <marker id="ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#1C64F2"/></marker>
+  <marker id="at" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#0B8EA0"/></marker>
+  <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#9CA3AF"/></marker>
+</defs>
+<rect x="0" y="0" width="1300" height="620" rx="14" fill="#FFFFFF"/>
+<text x="24" y="34" font-size="18" font-weight="700" fill="#111827">slogic16u3-trace on Sipeed SLogic16U3: target trace → USB 3.0 → PC</text>
+<text x="24" y="56" font-size="13" fill="#4B5563">Own FPGA image instead of the factory one. Dashed: next step (MIPI20 adapter, target JTAG/SWD).</text>
+
+<!-- target -->
+<rect x="24" y="120" width="180" height="190" rx="8" fill="#F3F4F6" stroke="#1F2937" stroke-width="1.6"/>
+<text x="114" y="146" font-size="14" font-weight="700" fill="#111827" text-anchor="middle">Target</text>
+<text x="114" y="174" font-size="12" fill="#111827" text-anchor="middle">STM32F407</text>
+<text x="114" y="190" font-size="11" fill="#4B5563" text-anchor="middle">TPIU: ITM, ETM</text>
+<text x="114" y="220" font-size="12" fill="#111827" text-anchor="middle">Baikal BE-U1000</text>
+<text x="114" y="236" font-size="11" fill="#4B5563" text-anchor="middle">RISC-V N-Trace, PIB</text>
+<text x="114" y="268" font-size="11" fill="#4B5563" text-anchor="middle">4-bit port, DDR,</text>
+<text x="114" y="284" font-size="11" fill="#4B5563" text-anchor="middle">TRACECLK up to 84 MHz</text>
+
+<!-- adapter (next step) -->
+<rect x="232" y="120" width="140" height="190" rx="8" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="302" y="146" font-size="13" font-weight="700" fill="#6B7280" text-anchor="middle">Adapter</text>
+<text x="302" y="164" font-size="11" fill="#6B7280" text-anchor="middle">(next step)</text>
+<text x="302" y="204" font-size="11" fill="#6B7280" text-anchor="middle">MIPI20</text>
+<text x="302" y="220" font-size="11" fill="#6B7280" text-anchor="middle">JTAG/SWD buffers</text>
+<text x="302" y="236" font-size="11" fill="#6B7280" text-anchor="middle">at target VREF</text>
+<text x="302" y="282" font-size="11" fill="#6B7280" text-anchor="middle">for now trace goes</text>
+<text x="302" y="298" font-size="11" fill="#6B7280" text-anchor="middle">over wires</text>
+
+<!-- trace: target -> input header -->
+<path d="M204 182 L408 182" fill="none" stroke="#E8590C" stroke-width="2.4" marker-end="url(#ao)"/>
+<text x="24" y="104" font-size="11" font-weight="600" fill="#E8590C">TRACECLK, TRACED0..3 →</text>
+<path d="M408 258 L204 258" fill="none" stroke="#9CA3AF" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#ag)"/>
+<text x="232" y="330" font-size="11" fill="#6B7280">← JTAG/SWD (TODO)</text>
+
+<!-- SLogic16U3 -->
+<rect x="398" y="80" width="612" height="430" rx="10" fill="#EEF2FF" stroke="#1E3A8A" stroke-width="2"/>
+<text x="414" y="102" font-size="14" font-weight="700" fill="#1E3A8A">Sipeed SLogic16U3</text>
+<rect x="410" y="140" width="56" height="150" rx="4" fill="#FEF3C7" stroke="#B45309" stroke-width="1.4"/>
+<text x="438" y="160" font-size="11" font-weight="700" fill="#92400E" text-anchor="middle">inputs</text>
+<text x="438" y="186" font-size="10" fill="#92400E" text-anchor="middle">CH8..11</text>
+<text x="438" y="200" font-size="10" fill="#92400E" text-anchor="middle">TRACED</text>
+<text x="438" y="230" font-size="10" fill="#92400E" text-anchor="middle">CH12</text>
+<text x="438" y="244" font-size="10" fill="#92400E" text-anchor="middle">TRACECLK</text>
+<text x="438" y="274" font-size="9" fill="#92400E" text-anchor="middle">divider ≈0.47</text>
+
+<rect x="480" y="116" width="518" height="306" rx="8" fill="#FFFFFF" stroke="#1F2937" stroke-width="1.6"/>
+<text x="494" y="136" font-size="13" font-weight="700" fill="#111827">FPGA Gowin GW5AT-15</text>
+
+<rect x="494" y="150" width="110" height="64" rx="6" fill="#FFF7ED" stroke="#E8590C" stroke-width="1.4"/>
+<text x="549" y="172" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">IODELAY + IDDR</text>
+<text x="549" y="188" font-size="10" fill="#4B5563" text-anchor="middle">on TRACECLK</text>
+<text x="549" y="203" font-size="10" fill="#4B5563" text-anchor="middle">a byte per clock</text>
+<rect x="620" y="150" width="104" height="64" rx="6" fill="#FFF7ED" stroke="#E8590C" stroke-width="1.4"/>
+<text x="672" y="172" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">afifo</text>
+<text x="672" y="188" font-size="10" fill="#4B5563" text-anchor="middle">512 words</text>
+<text x="672" y="203" font-size="10" fill="#4B5563" text-anchor="middle">TRACECLK → pclk</text>
+<rect x="740" y="150" width="104" height="64" rx="6" fill="#FFF7ED" stroke="#E8590C" stroke-width="1.4"/>
+<text x="792" y="172" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">sfifo</text>
+<text x="792" y="188" font-size="10" fill="#4B5563" text-anchor="middle">16 KB, 125 MHz</text>
+<text x="792" y="203" font-size="10" fill="#4B5563" text-anchor="middle">drop counters</text>
+<rect x="860" y="150" width="126" height="64" rx="6" fill="#EFF6FF" stroke="#1C64F2" stroke-width="1.4"/>
+<text x="923" y="172" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">Usb3Device</text>
+<text x="923" y="188" font-size="10" fill="#4B5563" text-anchor="middle">EP1 IN, 32 bits</text>
+<text x="923" y="203" font-size="10" fill="#4B5563" text-anchor="middle">EP0: registers</text>
+<path d="M466 215 L494 182" fill="none" stroke="#E8590C" stroke-width="2" marker-end="url(#ao)"/>
+<path d="M604 182 L618 182" fill="none" stroke="#E8590C" stroke-width="2" marker-end="url(#ao)"/>
+<path d="M724 182 L738 182" fill="none" stroke="#E8590C" stroke-width="2" marker-end="url(#ao)"/>
+<path d="M844 182 L858 182" fill="none" stroke="#E8590C" stroke-width="2" marker-end="url(#ao)"/>
+
+<rect x="860" y="236" width="126" height="56" rx="6" fill="#EFF6FF" stroke="#1C64F2" stroke-width="1.4"/>
+<text x="923" y="258" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">Usb3Top</text>
+<text x="923" y="274" font-size="10" fill="#4B5563" text-anchor="middle">LTSSM, link</text>
+<rect x="860" y="312" width="126" height="56" rx="6" fill="#EFF6FF" stroke="#1C64F2" stroke-width="1.4"/>
+<text x="923" y="334" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">USB 3.0 PHY</text>
+<text x="923" y="350" font-size="10" fill="#4B5563" text-anchor="middle">SerDes Q0, 5 Gbit/s</text>
+<path d="M923 214 L923 234" fill="none" stroke="#1C64F2" stroke-width="2" marker-start="url(#ab)" marker-end="url(#ab)"/>
+<path d="M923 292 L923 310" fill="none" stroke="#1C64F2" stroke-width="2" marker-start="url(#ab)" marker-end="url(#ab)"/>
+<text x="742" y="244" font-size="10" fill="#4B5563">USB 3.0 stack (Veryl),</text>
+<text x="742" y="258" font-size="10" fill="#4B5563">pclk 125 MHz, PIPE 32 bits</text>
+
+<rect x="494" y="312" width="180" height="56" rx="6" fill="#ECFEFF" stroke="#0B8EA0" stroke-width="1.4"/>
+<text x="584" y="334" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">configuration loaded</text>
+<text x="584" y="350" font-size="10" fill="#4B5563" text-anchor="middle">from flash; MODE → DFU</text>
+<rect x="690" y="312" width="150" height="56" rx="6" fill="#F9FAFB" stroke="#6B7280" stroke-width="1.2"/>
+<text x="765" y="334" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">125 MHz oscillator</text>
+<text x="765" y="350" font-size="10" fill="#4B5563" text-anchor="middle">→ REFCLK0 SerDes</text>
+<path d="M840 340 L858 340" fill="none" stroke="#6B7280" stroke-width="1.6" marker-end="url(#ag)"/>
+
+<rect x="494" y="386" width="346" height="26" rx="5" fill="#F9FAFB" stroke="#9CA3AF" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="667" y="403" font-size="10" fill="#6B7280" text-anchor="middle">TODO: target JTAG/SWD engine, outputs through the same CH inputs</text>
+
+<!-- flash -->
+<rect x="494" y="440" width="180" height="56" rx="6" fill="#ECFEFF" stroke="#0B8EA0" stroke-width="1.4"/>
+<text x="584" y="462" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">SPI flash 16 MiB</text>
+<text x="584" y="478" font-size="10" fill="#4B5563" text-anchor="middle">0x0 — usb3d, 0x800000 — DFU</text>
+<path d="M584 440 L584 370" fill="none" stroke="#0B8EA0" stroke-width="2" marker-end="url(#at)"/>
+
+<!-- USB-C -->
+<rect x="996" y="322" width="30" height="36" rx="4" fill="#B8BCC4" stroke="#71717A" stroke-width="1.4"/>
+<text x="1011" y="374" font-size="10" fill="#4B5563" text-anchor="middle">USB-C</text>
+<path d="M986 340 L994 340" fill="none" stroke="#1C64F2" stroke-width="2"/>
+
+
+
+<!-- PC -->
+<rect x="1070" y="80" width="206" height="430" rx="10" fill="#F3F4F6" stroke="#1F2937" stroke-width="1.6"/>
+<text x="1173" y="106" font-size="14" font-weight="700" fill="#111827" text-anchor="middle">PC</text>
+<text x="1173" y="124" font-size="11" fill="#4B5563" text-anchor="middle">Windows (WinUSB) / Linux</text>
+<rect x="1084" y="140" width="178" height="54" rx="6" fill="#FFFFFF" stroke="#1C64F2" stroke-width="1.2"/>
+<text x="1173" y="161" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">usb3d.py</text>
+<text x="1173" y="178" font-size="10" fill="#4B5563" text-anchor="middle">registers, cap → file</text>
+<rect x="1084" y="208" width="178" height="54" rx="6" fill="#FFFFFF" stroke="#E8590C" stroke-width="1.2"/>
+<text x="1173" y="229" font-size="10" font-weight="700" fill="#111827" text-anchor="middle">tpiu_decode / ntrace_decode</text>
+<text x="1173" y="246" font-size="10" fill="#4B5563" text-anchor="middle">TPIU → ITM/ETM, N-Trace</text>
+<rect x="1084" y="276" width="178" height="54" rx="6" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="1173" y="297" font-size="11" font-weight="700" fill="#6B7280" text-anchor="middle">Orbuculum, OpenCSD</text>
+<text x="1173" y="314" font-size="10" fill="#6B7280" text-anchor="middle">(TODO)</text>
+<rect x="1084" y="430" width="178" height="54" rx="6" fill="#FFFFFF" stroke="#0B8EA0" stroke-width="1.2"/>
+<text x="1173" y="451" font-size="11" font-weight="700" fill="#111827" text-anchor="middle">slogic_dfu.py</text>
+<text x="1173" y="468" font-size="10" fill="#4B5563" text-anchor="middle">writes the image to flash</text>
+<path d="M1173 194 L1173 206" fill="none" stroke="#E8590C" stroke-width="2" marker-end="url(#ao)"/>
+<path d="M1173 262 L1173 274" fill="none" stroke="#9CA3AF" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ag)"/>
+<path d="M1026 340 L1048 340 L1048 167 L1082 167" fill="none" stroke="#1C64F2" stroke-width="2.4" marker-end="url(#ab)"/>
+<text x="1064" y="330" font-size="11" font-weight="600" fill="#1C64F2" transform="rotate(-90 1064 330)">USB 3.0, up to 465 MB/s</text>
+<path d="M1082 457 L1040 457 L1040 540 L584 540 L584 498" fill="none" stroke="#0B8EA0" stroke-width="2" marker-end="url(#at)"/>
+<text x="812" y="532" font-size="11" fill="#0B8EA0" text-anchor="middle">USB 2.0, DFU mode: image to flash</text>
+
+<!-- legend -->
+<path d="M24 548 L50 548" stroke="#E8590C" stroke-width="2.5"/><text x="56" y="552" font-size="12" fill="#4B5563">trace</text>
+<path d="M124 548 L150 548" stroke="#1C64F2" stroke-width="2.5"/><text x="156" y="552" font-size="12" fill="#4B5563">USB 3.0</text>
+<path d="M228 548 L254 548" stroke="#0B8EA0" stroke-width="2.5"/><text x="260" y="552" font-size="12" fill="#4B5563">firmware (DFU)</text>
+<path d="M24 574 L50 574" stroke="#9CA3AF" stroke-width="2.5" stroke-dasharray="5 4"/><text x="56" y="578" font-size="12" fill="#4B5563">next step</text>
+</svg>

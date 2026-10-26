@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: BSL-1.0
+// Copyright Kenta Ida 2026.
+// Distributed under the Boost Software License, Version 1.0.
+//    (See accompanying file LICENSE_1_0.txt or copy at
+//          https://www.boost.org/LICENSE_1_0.txt)
+/**
+ * @file usb3_rx_fifo.veryl
+ * @brief Receive symbol window: a plain shift register of the last 24
+ *        symbols (6 PIPE words) with the raw and descrambled copies, the K
+ *        flag and the class bits of each symbol, plus a fill count.
+ *
+ * Nothing is removed or realigned here: the parser keeps a registered
+ * read position into this window, which keeps its decision loop short.
+ * The window shifts by one word on every PHY word. A clock without one
+ * (RxValid 0: the PHY's elastic buffer inserts them anywhere, also inside a
+ * packet) holds it and o_adv = 0 stalls the parser; only after GAP_FLUSH
+ * such clocks in a row is a word without class bits shifted in, so that the
+ * last symbols of a stream (e.g. LPMA before U3) still reach the parser.
+ * SKP symbols stay in the stream and are ignored by the parser.
+ */
+module Usb3RxFifo #(
+    param GAP_FLUSH: u32 = 6, // clocks without a PHY word before the window advances anyway
+) (
+    i_clk  : input  clock     ,
+    i_rst  : input  reset     ,
+    i_flush: input  logic     , // discard everything (link state change)
+    i_valid: input  logic     ,
+    i_raw  : input  logic<32> ,
+    i_desc : input  logic<32> ,
+    i_k    : input  logic<4>  ,
+    i_cls  : input  logic<32> , // symbol class bits (usb3_pkg::sym_class) per symbol
+    o_raw  : output logic<192>, // window symbol j = [j*8 +: 8], j = 0 oldest
+    o_desc : output logic<192>,
+    o_k    : output logic<24> ,
+    o_cls  : output logic<192>,
+    o_fill : output logic<5>  , // valid symbols at the top of the window (saturates at 24)
+    o_adv  : output logic     , // the window shifts at the end of this clock
+) {
+    const N: u32 = 24;
+
+    var fill: logic<5>;
+    assign o_fill = fill;
+    var gap: logic<3>; // clocks without a PHY word in a row (saturating)
+    assign o_adv = i_valid || gap >= GAP_FLUSH as 3;
+
+    always_ff {
+        if_reset {
+            fill   = 0;
+            gap    = 0;
+            o_raw  = 0;
+            o_desc = 0;
+            o_k    = 0;
+            o_cls  = 0;
+        } else if i_flush {
+            fill = 0;
+            gap  = 0;
+        } else if o_adv {
+            gap = if i_valid ? 0 : gap;
+            if i_valid {
+                o_raw  = {i_raw, o_raw[191:32]};
+                o_desc = {i_desc, o_desc[191:32]};
+                o_k    = {i_k, o_k[23:4]};
+                o_cls  = {i_cls, o_cls[191:32]};
+            } else {
+                o_raw  = {32'h0, o_raw[191:32]};
+                o_desc = {32'h0, o_desc[191:32]};
+                o_k    = {4'h0, o_k[23:4]};
+                o_cls  = {32'h0, o_cls[191:32]};
+            }
+            if fill <= (N - 4) as 5 {
+                fill = fill + 4;
+            }
+        } else if gap != 7 {
+            gap = gap + 1;
+        }
+    }
+}

@@ -1,0 +1,1230 @@
+// SPDX-License-Identifier: BSL-1.0
+// Copyright Kenta Ida 2026.
+// Distributed under the Boost Software License, Version 1.0.
+//    (See accompanying file LICENSE_1_0.txt or copy at
+//          https://www.boost.org/LICENSE_1_0.txt)
+/**
+ * @file usb3_device.veryl
+ * @brief Protocol and device layers of the SuperSpeed sample device
+ *        (USB 3.2 ch. 8 / 9) on top of Usb3Top.
+ *
+ * Endpoints: EP0 control (512 bytes), EP1 OUT bulk (1024 bytes, bMaxBurst 0,
+ * one data packet outstanding), EP1 IN bulk (1024 bytes, bMaxBurst
+ * IN_BUFS - 1: a ring of IN_BUFS packet buffers; data packets go out back to
+ * back up to the NumP the host's ACK allows, are kept until acknowledged and
+ * resent from the requested SeqNum on a retry). EP1 is exposed as a byte
+ * stream with the same ports as the USB 2.0 UsbDevice (EP1_STREAM): bytes
+ * written to i_tx_* are packed into 1024-byte packets and sent when the
+ * host asks; a partial packet (or a ZLP after a full one) is sent after
+ * STREAM_FLUSH_US of idle. Bytes received on EP1 OUT come out of o_rx_*.
+ * i_txw_* is a second, 32-bit entry to the same EP1 IN stream (4 bytes per
+ * clock, byte 0 in [7:0]; accepted only at a word boundary of the packet
+ * being filled): use one of the two at a time (the byte port wins a clash).
+ *
+ * Standard requests: GET_STATUS, CLEAR/SET_FEATURE (endpoint halt, U1/U2
+ * enable accepted and ignored), SET_ADDRESS, GET_DESCRIPTOR (device,
+ * configuration, string, BOS), GET/SET_CONFIGURATION, GET/SET_INTERFACE,
+ * SET_SEL, SET_ISOCH_DELAY; vendor 0x01 IN (i_vendor_status), 0x02 OUT
+ * (o_vendor_reg = wValue), 0x03 OUT (register write: o_reg_wr with
+ * o_reg_addr = wIndex, o_reg_wdata = wValue), 0x04 IN (register read: 4
+ * bytes of i_reg_rdata for o_reg_addr = wIndex), MS_VENDOR_CODE IN wIndex 7
+ * (MS OS 2.0 set).
+ *
+ * Data for outgoing DPPs is read by the framer through o_dpp_rd/addr:
+ * words 0x000..0x7FF come from the EP1 IN packet buffers, 0xC00 from the
+ * small control response register, 0x800.. from the descriptor ROM.
+ */
+module Usb3Device #(
+    param CLK_PER_US     : u32       = 125     ,
+    param VENDOR_ID      : logic<16> = 16'h1209,
+    param PRODUCT_ID     : logic<16> = 16'h0001,
+    param STREAM_FLUSH_US: u32       = 1000    ,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // ---- link (Usb3Top) ----
+    i_in_u0      : input  logic    ,
+    i_hot_reset  : input  logic    ,
+    i_warm_reset : input  logic    ,
+    i_rx_hp_valid: input  logic    ,
+    i_rx_hp_hdr  : input  logic<96>,
+    i_dpp_start  : input  logic    ,
+    i_dpp_valid  : input  logic    ,
+    i_dpp_data   : input  logic<32>,
+    i_dpp_be     : input  logic<4> ,
+    i_dpp_end    : input  logic    ,
+    i_dpp_err    : input  logic    ,
+    o_tx_hp_valid: output logic    ,
+    o_tx_hp_hdr  : output logic<96>,
+    o_tx_dpp     : output logic    ,
+    o_tx_dpp_len : output logic<11>,
+    o_tx_dpp_base: output logic<13>,
+    i_tx_hp_ready: input  logic    ,
+    i_dpp_rd     : input  logic    ,
+    i_dpp_addr   : input  logic<13>,
+    o_dpp_data   : output logic<32>,
+
+    // ---- status ----
+    o_configured: output logic    ,
+    o_address   : output logic<7> ,
+    o_reset     : output logic    , // pulse: Hot/Warm Reset
+    o_dbg_event : output logic    , // pulse (debug): an EP1 IN ACK ignored or with Retry, or a response lost
+    o_dbg_strobe: output logic    , // pulse (debug): an EP1 IN ACK handled (1 clock later) or a data packet issued
+    o_dbg_state : output logic<64>, // (debug) {flags, in_ready, in_ack, in_nsent, in_limit, seq_in} after it
+
+    // ---- vendor request scratch ----
+    o_vendor_reg   : output logic<16>,
+    i_vendor_status: input  logic<32>,
+    // ---- vendor register port (requests 0x03 / 0x04) ----
+    o_reg_wr   : output logic    , // pulse
+    o_reg_addr : output logic<8> , // wIndex of the request (valid with o_reg_wr; i_reg_rdata is read for it)
+    o_reg_wdata: output logic<16>, // wValue
+    i_reg_rdata: input  logic<32>, // combinational from o_reg_addr
+
+    // ---- EP1 byte streams ----
+    o_rx_valid: output logic   ,
+    o_rx_data : output logic<8>,
+    i_rx_ready: input  logic   ,
+    i_tx_valid: input  logic   ,
+    i_tx_data : input  logic<8>,
+    o_tx_ready: output logic   ,
+    // ---- EP1 IN word stream (4 bytes per clock) ----
+    i_txw_valid: input  logic    ,
+    i_txw_data : input  logic<32>,
+    o_txw_ready: output logic    ,
+) {
+    import usb3_pkg::*;
+    import usb3_desc_pkg::*;
+
+    const IN_BUFS   : u32 = 16; // EP1 IN packet buffers (1024 bytes each; bMaxBurst = IN_BUFS - 1 in the ROM)
+    const SMALL_ADDR: u32 = 13'h1800;
+    // framer read address map (words): EP1 IN buffers 0x0000-0x0FFF, ROM 0x1000 (ROM_BASE), small_r 0x1800
+
+    // ---------------------------------------------------------------- memories
+    var in_ram  : logic<32> [IN_BUFS * 256]; // EP1 IN packet buffers
+    var out_ram : logic<32> [256]          ; // EP1 OUT packet buffer
+    var rom_q   : logic<32>                ;
+    var rom_addr: logic<8>                 ;
+
+    inst u_rom: Usb3DescriptorRom #(
+        VENDOR_ID : VENDOR_ID ,
+        PRODUCT_ID: PRODUCT_ID,
+    ) (
+        i_addr: rom_addr,
+        o_data: rom_q   ,
+    );
+    assign rom_addr = i_dpp_addr[7:0];
+
+    var small_r: logic<32>;
+    always_ff {
+        if i_dpp_rd {
+            if i_dpp_addr[12:11] == 2'b11 {
+                o_dpp_data = small_r;
+            } else if i_dpp_addr[12] {
+                o_dpp_data = rom_q;
+            } else {
+                o_dpp_data = in_ram[i_dpp_addr[11:0]];
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- device state
+    var configured: logic    ;
+    var dev_addr  : logic<7> ;
+    var addr_pend : logic<7> ;
+    var addr_apply: logic    ;
+    var halt_in   : logic    ;
+    var halt_out  : logic    ;
+    var vendor_reg: logic<16>;
+    var reset_evt : logic    ;
+    var seq_in    : logic<5> ; // EP1 IN next sequence number
+    var seq_out   : logic<5> ; // EP1 OUT expected sequence number
+
+    assign o_configured = configured;
+    assign o_address    = dev_addr;
+    assign o_vendor_reg = vendor_reg;
+    var reg_wr: logic;
+    assign o_reg_wr = reg_wr;
+    assign o_reset  = reset_evt;
+
+    // ---------------------------------------------------------------- input pipeline stage
+    // The link's header and the parser's DPP stream are registered here so
+    // that the request decode starts from local registers (timing).
+    var q_hp_valid : logic    ;
+    var q_hp_hdr   : logic<96>;
+    var q_dpp_start: logic    ;
+    var q_dpp_valid: logic    ;
+    var q_dpp_data : logic<32>;
+    var q_dpp_be   : logic<4> ;
+    var q_dpp_end  : logic    ;
+    var q_dpp_err  : logic    ;
+    always_ff {
+        if_reset {
+            q_hp_valid  = 0;
+            q_hp_hdr    = 0;
+            q_dpp_start = 0;
+            q_dpp_valid = 0;
+            q_dpp_data  = 0;
+            q_dpp_be    = 0;
+            q_dpp_end   = 0;
+            q_dpp_err   = 0;
+        } else {
+            q_hp_valid  = i_rx_hp_valid;
+            q_hp_hdr    = i_rx_hp_hdr;
+            q_dpp_start = i_dpp_start;
+            q_dpp_valid = i_dpp_valid;
+            q_dpp_data  = i_dpp_data;
+            q_dpp_be    = i_dpp_be;
+            q_dpp_end   = i_dpp_end;
+            q_dpp_err   = i_dpp_err;
+        }
+    }
+
+    // ---------------------------------------------------------------- received header decode (second register stage)
+    var hp_valid: logic    ;
+    var hp_type : logic<5> ;
+    var hp_sub  : logic<4> ;
+    var hp_rty  : logic    ;
+    var hp_dir  : logic    ;
+    var hp_ept  : logic<4> ;
+    var hp_nump : logic<5> ;
+    var hp_seq  : logic<5> ; // TP sequence number
+    var hp_acked: logic<5> ; // hp_seq - seq_in
+    var dp_seq  : logic<5> ; // DP sequence number
+    var dp_setup: logic    ;
+    var dp_len  : logic<16>;
+    var hp_mine : logic    ;
+    var d_start : logic    ;
+    var d_valid : logic    ;
+    var d_data  : logic<32>;
+    var d_be    : logic<4> ;
+    var d_end   : logic    ;
+    var d_err   : logic    ;
+    always_ff {
+        if_reset {
+            hp_valid = 0;
+            hp_type  = 0;
+            hp_sub   = 0;
+            hp_rty   = 0;
+            hp_dir   = 0;
+            hp_ept   = 0;
+            hp_nump  = 0;
+            hp_seq   = 0;
+            hp_acked = 0;
+            dp_seq   = 0;
+            dp_setup = 0;
+            dp_len   = 0;
+            hp_mine  = 0;
+            d_start  = 0;
+            d_valid  = 0;
+            d_data   = 0;
+            d_be     = 0;
+            d_end    = 0;
+            d_err    = 0;
+        } else {
+            hp_valid = q_hp_valid;
+            hp_type  = q_hp_hdr[4:0];
+            hp_sub   = q_hp_hdr[35:32];
+            hp_rty   = q_hp_hdr[38];
+            hp_dir   = q_hp_hdr[39];
+            hp_ept   = q_hp_hdr[43:40];
+            hp_nump  = q_hp_hdr[52:48];
+            hp_seq   = q_hp_hdr[57:53];
+            // packets an EP1 IN ACK acknowledges, precomputed here (off the ACK handling path;
+            // headers are >= 5 clocks apart, so seq_in cannot change in between)
+            hp_acked = q_hp_hdr[57:53] - seq_in;
+            dp_seq   = q_hp_hdr[36:32];
+            dp_setup = q_hp_hdr[47];
+            dp_len   = q_hp_hdr[63:48];
+            hp_mine  = q_hp_hdr[31:25] == dev_addr;
+            d_start  = q_dpp_start;
+            d_valid  = q_dpp_valid;
+            d_data   = q_dpp_data;
+            d_be     = q_dpp_be;
+            d_end    = q_dpp_end;
+            d_err    = q_dpp_err;
+        }
+    }
+
+    // ---------------------------------------------------------------- header builders
+    // addr: the device address the packet is sent from, latched with the request (tx_addr): the ACK
+    // that completes a SET_ADDRESS status stage still goes out from the old address (9.4.6), while
+    // dev_addr already holds the new one
+    function tp_hdr (
+        addr: input logic<7>,
+        sub : input logic<4>,
+        dir : input logic   ,
+        ept : input logic<4>,
+        nump: input logic<5>,
+        seq : input logic<5>,
+        rty : input logic   ,
+    ) -> logic<96> {
+        return {32'h0, 6'h0, seq, nump, 4'h0, ept, dir, rty, 2'b00, sub, addr, 20'h0, PKT_TP};
+    }
+    function dp_hdr (
+        addr: input logic<7> ,
+        ept : input logic<4> ,
+        seq : input logic<5> ,
+        len : input logic<16>,
+        eob : input logic    ,
+    ) -> logic<96> {
+        return {32'h0, len, 4'h0, ept, 1'b1, eob, 1'b0, seq, addr, 20'h0, PKT_DP};
+    }
+    const SUB_ACK      : logic<4> = 4'b0001;
+    const SUB_NRDY     : logic<4> = 4'b0010;
+    const SUB_ERDY     : logic<4> = 4'b0011;
+    const SUB_STATUS   : logic<4> = 4'b0100;
+    const SUB_STALL    : logic<4> = 4'b0101;
+    const SUB_PING     : logic<4> = 4'b0111;
+    const SUB_PING_RESP: logic<4> = 4'b1000;
+
+    // ---------------------------------------------------------------- transmit request queue (one at a time)
+    var tx_valid: logic        ;
+    var rq      : logic<70> [2]; // responses waiting for the link slot (see the hand-off at the end)
+    var rq_n    : logic<2>     ;
+    var dbg_ev  : logic        ;
+    var dbg_nseq: logic<5>     ; // (debug) SeqNum the next new EP1 IN data packet should carry
+    assign o_dbg_event = dbg_ev;
+    var dbg_stb: logic;
+    assign o_dbg_strobe = dbg_stb;
+    var tx_is_dp: logic    ;
+    var tx_sub  : logic<4> ;
+    var tx_dir  : logic    ;
+    var tx_ept  : logic<4> ;
+    var tx_nump : logic<5> ;
+    var tx_seq  : logic<5> ;
+    var tx_rty  : logic    ;
+    var tx_addr : logic<7> ;
+    var tx_eob  : logic    ;
+    var tx_dlen : logic<16>;
+    var tx_dpp  : logic    ;
+    var tx_len  : logic<11>;
+    var tx_base : logic<13>;
+    assign o_tx_hp_valid = tx_valid;
+    assign o_tx_hp_hdr   = if tx_is_dp ?
+        dp_hdr(tx_addr, tx_ept, tx_seq, tx_dlen, tx_eob)
+    :
+        tp_hdr(tx_addr, tx_sub, tx_dir, tx_ept, tx_nump, tx_seq, tx_rty)
+    ;
+    assign o_tx_dpp      = tx_dpp;
+    assign o_tx_dpp_len  = tx_len;
+    assign o_tx_dpp_base = tx_base;
+    var tx_take: logic;
+    assign tx_take = tx_valid && i_tx_hp_ready;
+
+    // ---------------------------------------------------------------- control transfer state
+    enum Ctrl: logic<3> {
+        Idle,
+        DataIn, // we send DPs on ACK
+        DataOut, // host sends DPs
+        Status, // waiting for STATUS TP
+        Stall,
+    }
+    var ctrl         : Ctrl     ;
+    var ctrl_base    : logic<13>;
+    var ctrl_remain  : logic<11>; // bytes still to send
+    var ctrl_zlp     : logic    ; // a zero-length DP terminates the transfer
+    var ctrl_seq     : logic<5> ;
+    var ep0_rx_seq   : logic<5> ; // EP0: next expected OUT data packet sequence number (SETUP 0 -> 1, + data stage)
+    var ctrl_sending : logic    ; // a DP was handed to the link, waiting for its ACK
+    var ctrl_last_len: logic<11>;
+    var setup_buf    : logic<64>;
+    var setup_pend   : logic    ; // SETUP DPP complete, to be processed
+    var setup_go     : logic    ; // decode registered, act now
+    var r_desc_addr  : logic<13>;
+    var r_desc_ok    : logic    ;
+    var r_len_desc   : logic<11>;
+    var r_zlp_desc   : logic    ;
+    var r_len1       : logic<11>;
+    var r_len2       : logic<11>;
+    var r_len4       : logic<11>;
+    var r_len_msos   : logic<11>;
+    var dpp_target   : logic<2> ; // 0 none, 1 setup, 2 EP1 OUT, 3 control OUT data (discarded)
+    var dpp_widx     : logic<8> ;
+    var dpp_len_q    : logic<11>; // Data Length of the DP header being received
+    var dpp_good     : logic    ;
+
+    // request fields
+    var bm_req  : logic<8> ;
+    var b_req   : logic<8> ;
+    var w_value : logic<16>;
+    var w_index : logic<16>;
+    var w_length: logic<16>;
+    assign bm_req      = setup_buf[7:0];
+    assign b_req       = setup_buf[15:8];
+    assign w_value     = setup_buf[31:16];
+    assign w_index     = setup_buf[47:32];
+    assign o_reg_addr  = w_index[7:0];
+    assign o_reg_wdata = w_value;
+    assign w_length    = setup_buf[63:48];
+
+    var desc_addr: logic<13>;
+    var desc_len : logic<11>;
+    var desc_ok  : logic    ;
+    always_comb {
+        desc_addr = 0;
+        desc_len  = 0;
+        desc_ok   = 0;
+        case w_value[15:8] {
+            8'h01: {
+                desc_addr = DEV_ADDR;
+                desc_len  = DEV_LEN;
+                desc_ok   = 1;
+            }
+            8'h02: {
+                if w_value[7:0] == 0 {
+                    desc_addr = CFG_ADDR;
+                    desc_len  = CFG_LEN;
+                    desc_ok   = 1;
+                }
+            }
+            8'h03: {
+                case w_value[7:0] {
+                    8'd0: {
+                        desc_addr = STR0_ADDR;
+                        desc_len  = STR0_LEN;
+                        desc_ok   = 1;
+                    }
+                    8'd1: {
+                        desc_addr = STR1_ADDR;
+                        desc_len  = STR1_LEN;
+                        desc_ok   = 1;
+                    }
+                    8'd2: {
+                        desc_addr = STR2_ADDR;
+                        desc_len  = STR2_LEN;
+                        desc_ok   = 1;
+                    }
+                    8'd3: {
+                        desc_addr = STR3_ADDR;
+                        desc_len  = STR3_LEN;
+                        desc_ok   = 1;
+                    }
+                    default: {}
+                }
+            }
+            8'h0F: {
+                desc_addr = BOS_ADDR;
+                desc_len  = BOS_LEN;
+                desc_ok   = 1;
+            }
+            default: {}
+        }
+    }
+    function min_len (
+        a: input logic<11>,
+        b: input logic<16>,
+    ) -> logic<11> {
+        return if {5'b0, a} <: b ? a : b[10:0];
+    }
+
+    // ---------------------------------------------------------------- EP1 IN packet buffers
+    var in_wptr : logic<11>               ; // bytes in the buffer being filled (0..1024)
+    var in_fill : logic<4>                ; // buffer index being filled
+    var in_word : logic<32>               ; // byte accumulator
+    var in_ready: logic<IN_BUFS>          ; // packet ready per buffer (until acknowledged)
+    var in_len  : logic<11>      [IN_BUFS];
+    var in_ack  : logic<4>                ; // oldest unacknowledged buffer (SeqNum seq_in)
+    var in_nsent: logic<5>                ; // buffers from in_ack on already sent, not acknowledged
+    var in_limit: logic<5>                ; // packets the host accepts from in_ack on (NumP of its last ACK)
+    var in_stop : logic                   ; // a short packet / ZLP in flight: hold further packets until it is acknowledged
+    var in_acked: logic<5>                ; // packets a received EP1 IN ACK acknowledges (its SeqNum - seq_in)
+    assign in_acked = hp_acked;
+    var in_flow    : logic    ; // NRDY answered: ERDY when a packet becomes ready
+    var in_zlp_pend: logic    ; // last closed packet was full: ZLP after idle
+    var idle_cnt   : logic<32>;
+    var flush      : logic    ;
+    var tx_we      : logic    ;
+    var tx_ww      : logic    ; // a word from i_txw_*
+    var tx_any     : logic    ;
+    assign tx_we       = i_tx_valid && o_tx_ready;
+    assign o_txw_ready = o_tx_ready && in_wptr[1:0] == 0;
+    assign tx_ww       = i_txw_valid && o_txw_ready && !i_tx_valid;
+    assign tx_any      = tx_we || tx_ww;
+    assign o_tx_ready  = configured && !in_ready[in_fill] && in_wptr != 1024;
+
+    assign o_dbg_state = {26'b0, in_flow, in_stop, configured, in_ready, in_ack, in_nsent, in_limit, seq_in};
+
+    var in_close: logic; // close the packet being filled
+    assign in_close = in_wptr == 1024 || (flush && in_wptr != 0);
+
+    // ---------------------------------------------------------------- EP1 OUT buffer
+    var out_len : logic<11>;
+    var out_rptr: logic<11>;
+    var out_full: logic    ; // a packet is in the buffer
+    var out_flow: logic    ; // NRDY answered: ERDY when the buffer frees
+    var out_q   : logic<32>;
+    var out_qv  : logic    ; // out_q holds the word at out_rptr[10:2]
+    var out_qidx: logic<9> ;
+
+    assign o_rx_valid = out_full && out_qv && out_qidx == out_rptr[10:2] && out_rptr <: out_len;
+    assign o_rx_data  = out_q[out_rptr[1:0] * 8+:8];
+
+    // ---------------------------------------------------------------- main
+    always_ff {
+        if_reset {
+            configured    = 0;
+            dev_addr      = 0;
+            addr_pend     = 0;
+            addr_apply    = 0;
+            halt_in       = 0;
+            halt_out      = 0;
+            vendor_reg    = 0;
+            reg_wr        = 0;
+            reset_evt     = 0;
+            seq_in        = 0;
+            dbg_nseq      = 0;
+            seq_out       = 0;
+            tx_valid      = 0;
+            dbg_ev        = 0;
+            dbg_stb       = 0;
+            rq_n          = 0;
+            rq            = '{0, 0};
+            tx_is_dp      = 0;
+            tx_sub        = 0;
+            tx_dir        = 0;
+            tx_ept        = 0;
+            tx_nump       = 0;
+            tx_seq        = 0;
+            tx_rty        = 0;
+            tx_addr       = 0;
+            tx_eob        = 0;
+            tx_dlen       = 0;
+            tx_dpp        = 0;
+            tx_len        = 0;
+            tx_base       = 0;
+            ctrl          = Ctrl::Idle;
+            ctrl_base     = 0;
+            ctrl_remain   = 0;
+            ctrl_zlp      = 0;
+            ctrl_seq      = 0;
+            ep0_rx_seq    = 0;
+            ctrl_sending  = 0;
+            ctrl_last_len = 0;
+            setup_buf     = 0;
+            setup_pend    = 0;
+            setup_go      = 0;
+            r_desc_addr   = 0;
+            r_desc_ok     = 0;
+            r_len_desc    = 0;
+            r_zlp_desc    = 0;
+            r_len1        = 0;
+            r_len2        = 0;
+            r_len4        = 0;
+            r_len_msos    = 0;
+            dpp_target    = 0;
+            dpp_widx      = 0;
+            dpp_len_q     = 0;
+            dpp_good      = 0;
+            small_r       = 0;
+            in_wptr       = 0;
+            in_fill       = 0;
+            in_word       = 0;
+            in_ready      = 0;
+            in_ack        = 0;
+            in_flow       = 0;
+            in_nsent      = 0;
+            in_limit      = 0;
+            in_stop       = 0;
+            in_zlp_pend   = 0;
+            idle_cnt      = 0;
+            flush         = 0;
+            out_len       = 0;
+            out_rptr      = 0;
+            out_full      = 0;
+            out_flow      = 0;
+            out_q         = 0;
+            out_qv        = 0;
+            out_qidx      = 0;
+        } else {
+            var send     : logic    ; // request a transmission this clock
+            var in_acknow: logic    ; // an EP1 IN ACK is handled this clock (no data packet issued then)
+            var s_is_dp  : logic    ;
+            var s_sub    : logic<4> ;
+            var s_dir    : logic    ;
+            var s_ept    : logic<4> ;
+            var s_nump   : logic<5> ;
+            var s_seq    : logic<5> ;
+            var s_rty    : logic    ;
+            var s_eob    : logic    ;
+            var s_dlen   : logic<16>;
+            var s_dpp    : logic    ;
+            var s_len    : logic<11>;
+            var s_base   : logic<13>;
+            send      = 0;
+            in_acknow = 0;
+            s_is_dp   = 0;
+            s_sub     = 0;
+            s_dir     = 0;
+            s_ept     = 0;
+            s_nump    = 0;
+            s_seq     = 0;
+            s_rty     = 0;
+            s_eob     = 0;
+            s_dlen    = 0;
+            s_dpp     = 0;
+            s_len     = 0;
+            s_base    = 0;
+            reset_evt = 0;
+            reg_wr    = 0;
+            flush     = 0;
+            dbg_ev    = 0;
+            dbg_stb   = 0;
+
+            if tx_take {
+                tx_valid = 0;
+            }
+
+            // ---- reset
+            if i_hot_reset || i_warm_reset {
+                configured   = 0;
+                dev_addr     = 0;
+                addr_apply   = 0;
+                halt_in      = 0;
+                halt_out     = 0;
+                seq_in       = 0;
+                dbg_nseq     = 0;
+                seq_out      = 0;
+                ctrl         = Ctrl::Idle;
+                ctrl_sending = 0;
+                setup_pend   = 0;
+                setup_go     = 0;
+                dpp_target   = 0;
+                in_wptr      = 0;
+                in_ready     = 0;
+                in_fill      = 0;
+                in_ack       = 0;
+                in_flow      = 0;
+                in_nsent     = 0;
+                in_limit     = 0;
+                in_stop      = 0;
+                in_zlp_pend  = 0;
+                out_full     = 0;
+                out_flow     = 0;
+                out_qv       = 0;
+                tx_valid     = 0;
+                rq_n         = 0;
+                reset_evt    = 1;
+            }
+
+            // ---- EP1 IN byte packing and packet closing
+            // (flush is cleared by new data and by the close it causes: once set it used to stay
+            // set, so every later one-clock gap in the stream closed a short packet)
+            if tx_ww {
+                in_ram[{in_fill, in_wptr[9:2]}] = i_txw_data;
+                in_wptr                         = in_wptr + 4;
+                idle_cnt                        = 0;
+                flush                           = 0;
+            } else if tx_we {
+                in_word[in_wptr[1:0] * 8+:8] = i_tx_data;
+                if in_wptr[1:0] == 3 {
+                    in_ram[{in_fill, in_wptr[9:2]}] = {i_tx_data, in_word[23:0]};
+                }
+                in_wptr  = in_wptr + 1;
+                idle_cnt = 0;
+                flush    = 0;
+            } else if configured && (in_wptr != 0 || in_zlp_pend) {
+                if idle_cnt == STREAM_FLUSH_US * CLK_PER_US {
+                    flush = 1;
+                } else {
+                    idle_cnt = idle_cnt + 1;
+                }
+            } else {
+                idle_cnt = 0;
+            }
+            if !tx_any && in_close && !in_ready[in_fill] {
+                if in_wptr[1:0] != 0 {
+                    in_ram[{in_fill, in_wptr[9:2]}] = in_word; // partial last word
+                }
+                in_len[in_fill]   = in_wptr;
+                in_ready[in_fill] = 1;
+                in_zlp_pend       = in_wptr == 1024;
+                in_wptr           = 0;
+                in_fill           = in_fill + 1;
+                idle_cnt          = 0;
+                flush             = flush && in_wptr == 1024; // a full packet closed by flush leaves the ZLP to send
+            } else if !tx_any && flush && in_zlp_pend && in_wptr == 0 && !in_ready[in_fill] {
+                in_len[in_fill]   = 0; // ZLP terminates the transfer
+                in_ready[in_fill] = 1;
+                in_zlp_pend       = 0;
+                in_fill           = in_fill + 1;
+                flush             = 0;
+            }
+
+            // ---- EP1 OUT byte drain
+            if out_full {
+                if !out_qv || out_qidx != out_rptr[10:2] {
+                    out_q    = out_ram[out_rptr[10:2]];
+                    out_qidx = out_rptr[10:2];
+                    out_qv   = 1;
+                } else if o_rx_valid && i_rx_ready {
+                    out_rptr = out_rptr + 1;
+                }
+                if out_rptr >= out_len && out_qv {
+                    out_full = 0;
+                    out_qv   = 0;
+                }
+            }
+
+            // ---- DPP reception
+            if d_start {
+                dpp_widx = 0;
+                dpp_good = 1;
+            }
+            if d_valid {
+                if dpp_target == 1 {
+                    if dpp_widx == 0 {
+                        setup_buf[31:0] = d_data;
+                    } else if dpp_widx == 1 {
+                        setup_buf[63:32] = d_data;
+                    }
+                } else if dpp_target == 2 {
+                    out_ram[dpp_widx] = d_data;
+                }
+                dpp_widx = dpp_widx + 1;
+            }
+            if d_end || d_err {
+                var ok: logic;
+                ok = d_end;
+                case dpp_target {
+                    1: {
+                        // SETUP: ACK Seq 1 NumP 1 (good) / ACK Seq 0 rty (bad)
+                        send    = 1;
+                        s_is_dp = 0;
+                        s_sub   = SUB_ACK;
+                        s_dir   = 0;
+                        s_ept   = 0;
+                        s_nump  = 1;
+                        s_seq   = if ok ? 1 : 0;
+                        s_rty   = !ok;
+                        if ok {
+                            setup_pend = 1;
+                            ep0_rx_seq = 1;
+                        }
+                    }
+                    2: {
+                        send = 1;
+                        if ok {
+                            out_len  = dpp_len_q;
+                            out_rptr = 0;
+                            out_full = 1;
+                            seq_out  = seq_out + 1;
+                            s_is_dp  = 0;
+                            s_sub    = SUB_ACK;
+                            s_dir    = 0;
+                            s_ept    = 1;
+                            s_nump   = 1;
+                            s_seq    = seq_out + 1;
+                            s_rty    = 0;
+                        } else {
+                            s_is_dp = 0;
+                            s_sub   = SUB_ACK;
+                            s_dir   = 0;
+                            s_ept   = 1;
+                            s_nump  = 1;
+                            s_seq   = seq_out;
+                            s_rty   = 1;
+                        }
+                    }
+                    3: {
+                        // control OUT data (SET_SEL ...): accepted and discarded
+                        send     = 1;
+                        ctrl_seq = ctrl_seq + 1;
+                        s_is_dp  = 0;
+                        s_sub    = SUB_ACK;
+                        s_dir    = 0;
+                        s_ept    = 0;
+                        s_nump   = 1;
+                        s_seq    = ctrl_seq + 1;
+                        s_rty    = 0;
+                        if ok {
+                            ctrl       = Ctrl::Status;
+                            ep0_rx_seq = ctrl_seq + 1;
+                        }
+                    }
+                    default: {}
+                }
+                dpp_target = 0;
+            }
+
+            // ---- received header packets
+            if hp_valid && hp_mine && (hp_type == PKT_TP || hp_type == PKT_DP) {
+                if hp_type == PKT_DP {
+                    if dp_setup && hp_ept == 0 && dp_seq == 0 && dp_len == 8 {
+                        dpp_target   = 1;
+                        ctrl         = Ctrl::Idle;
+                        ctrl_sending = 0;
+                    } else if hp_ept == 0 && !hp_dir && ctrl == Ctrl::DataOut && dp_seq == ctrl_seq {
+                        dpp_target = 3;
+                    } else if hp_ept == 1 && !hp_dir && configured {
+                        if halt_out {
+                            send    = 1;
+                            s_is_dp = 0;
+                            s_sub   = SUB_STALL;
+                            s_dir   = 0;
+                            s_ept   = 1;
+                            s_nump  = 0;
+                            s_seq   = 0;
+                            s_rty   = 0;
+                        } else if dp_seq != seq_out {
+                            // unexpected sequence number: ignore
+                        } else if out_full {
+                            send     = 1;
+                            s_is_dp  = 0;
+                            s_sub    = SUB_NRDY;
+                            s_dir    = 0;
+                            s_ept    = 1;
+                            s_nump   = 0;
+                            s_seq    = 0;
+                            s_rty    = 0;
+                            out_flow = 1;
+                        } else {
+                            dpp_target = 2;
+                            dpp_len_q  = dp_len[10:0];
+                        }
+                    }
+                } else {
+                    // transaction packets
+                    case hp_sub {
+                        SUB_ACK: {
+                            if hp_ept == 0 {
+                                if ctrl == Ctrl::DataIn {
+                                    if ctrl_sending && hp_seq == (ctrl_seq + 1) as 5 && !hp_rty { // (as 5: SeqNum wraps 31 -> 0)
+                                        // previous DP accepted
+                                        ctrl_sending = 0;
+                                        ctrl_seq     = ctrl_seq + 1;
+                                        ctrl_base    = ctrl_base + {5'h0, ctrl_last_len[10:2]}
+                                            + (if ctrl_last_len[1:0] != 0 ? 1 : 0);
+                                        ctrl_remain  = ctrl_remain - ctrl_last_len;
+                                        if ctrl_remain == ctrl_last_len && !(ctrl_zlp && ctrl_last_len == 512) {
+                                            ctrl = Ctrl::Status;
+                                        }
+                                    }
+                                    if (ctrl_sending && hp_rty) || !ctrl_sending {
+                                        // (re)send the next DP of the data stage
+                                        if hp_nump != 0 && (ctrl_remain != 0 || ctrl_zlp) && ctrl != Ctrl::Status {
+                                            var n: logic<11>;
+                                            n = if ctrl_remain >= 512 ? 512 : ctrl_remain;
+                                            if ctrl_sending && hp_rty {
+                                                n = ctrl_last_len;
+                                            }
+                                            send          = 1;
+                                            s_is_dp       = 1;
+                                            s_ept         = 0;
+                                            s_seq         = ctrl_seq;
+                                            s_dlen        = {5'h0, n};
+                                            s_eob         = 0;
+                                            s_dpp         = 1;
+                                            s_len         = n;
+                                            s_base        = ctrl_base;
+                                            ctrl_last_len = n;
+                                            ctrl_sending  = 1;
+                                            if n == 0 {
+                                                ctrl_zlp = 0;
+                                            }
+                                        }
+                                    }
+                                } else if ctrl == Ctrl::Stall {
+                                    send    = 1;
+                                    s_is_dp = 0;
+                                    s_sub   = SUB_STALL;
+                                    s_dir   = 0;
+                                    s_ept   = 0;
+                                    s_nump  = 0;
+                                    s_seq   = 0;
+                                    s_rty   = 0;
+                                }
+                            } else if hp_ept == 1 && hp_dir && configured {
+                                // host asks for EP1 IN data
+                                if halt_in {
+                                    send    = 1;
+                                    s_is_dp = 0;
+                                    s_sub   = SUB_STALL;
+                                    s_dir   = 1;
+                                    s_ept   = 1;
+                                    s_nump  = 0;
+                                    s_seq   = 0;
+                                    s_rty   = 0;
+                                } else if in_acked <= in_nsent {
+                                    dbg_ev    = hp_rty;
+                                    dbg_stb   = 1;
+                                    in_acknow = 1;
+                                    // ACK for EP1 IN: SeqNum = the next packet the host expects
+                                    // (everything before it is acknowledged), NumP = packets it
+                                    // accepts from there, Retry = resend from SeqNum
+                                    for i in 0..IN_BUFS {
+                                        if {1'b0, ((i as 4) - in_ack) as 4} <: in_acked {
+                                            in_ready[i] = 0;
+                                        }
+                                    }
+                                    in_ack = in_ack + in_acked[3:0];
+                                    seq_in = seq_in + in_acked;
+                                    // Retry: send again from SeqNum. (NumP 0 is not a reason: an xHC still takes packets in
+                                    // flight after it, resending them cost 25 % of the throughput)
+                                    in_nsent = if hp_rty ? 5'd0 : in_nsent - in_acked;
+                                    if hp_rty {
+                                        dbg_nseq = hp_seq;
+                                    }
+                                    if hp_rty || in_nsent == in_acked {
+                                        in_stop = 0; // the short packet was acknowledged (or is to be resent)
+                                    }
+                                    in_limit = hp_nump;
+                                    // nothing left to send: NRDY, ERDY once a packet is ready
+                                    if hp_nump != 0 && (hp_rty || in_nsent == in_acked)
+                                        && !in_ready[in_ack + in_acked[3:0]] {
+                                        send    = 1;
+                                        s_is_dp = 0;
+                                        s_sub   = SUB_NRDY;
+                                        s_dir   = 1;
+                                        s_ept   = 1;
+                                        s_nump  = 0;
+                                        s_seq   = 0;
+                                        s_rty   = 0;
+                                        in_flow = 1;
+                                        // flow controlled: nothing goes out before the host's ACK that follows ERDY
+                                        in_limit = 0;
+                                    }
+                                } else {
+                                    dbg_ev = 1; // SeqNum outside what is in flight: ignored
+                                }
+                            }
+                        }
+                        SUB_STATUS: {
+                            if hp_ept == 0 {
+                                send = 1;
+                                if ctrl == Ctrl::Status || ctrl == Ctrl::Idle
+                                    || (ctrl == Ctrl::DataIn && !ctrl_sending) {
+                                    // SeqNum: the next OUT data packet sequence number expected on
+                                    // EP0 (1 after a SETUP alone), as Gowin's reference device; an
+                                    // xHC behind a hub failed SET_ADDRESS on Seq 0 (8.12.2.3)
+                                    s_is_dp = 0;
+                                    s_sub   = SUB_ACK;
+                                    s_dir   = 0;
+                                    s_ept   = 0;
+                                    s_nump  = 0;
+                                    s_seq   = ep0_rx_seq;
+                                    s_rty   = 0;
+                                    ctrl    = Ctrl::Idle;
+                                    if addr_apply {
+                                        dev_addr   = addr_pend;
+                                        addr_apply = 0;
+                                    }
+                                } else {
+                                    s_is_dp = 0;
+                                    s_sub   = SUB_STALL;
+                                    s_dir   = 0;
+                                    s_ept   = 0;
+                                    s_nump  = 0;
+                                    s_seq   = 0;
+                                    s_rty   = 0;
+                                    ctrl    = Ctrl::Idle;
+                                }
+                            }
+                        }
+                        SUB_PING: {
+                            send    = 1;
+                            s_is_dp = 0;
+                            s_sub   = SUB_PING_RESP;
+                            s_dir   = hp_dir;
+                            s_ept   = hp_ept;
+                            s_nump  = 0;
+                            s_seq   = 0;
+                            s_rty   = 0;
+                        }
+                        default: {}
+                    }
+                }
+            }
+
+            // ---- EP1 IN data packets (bursts up to the host's NumP), ERDY when flow control ends
+            // (only with no response waiting: responses go first)
+            if !send && !tx_valid && rq_n == 0 {
+                // (not in the clock an ACK is handled: both update in_nsent, the later nonblocking
+                // assignment won and the ACK's decrement was lost - a SeqNum then got skipped)
+                if configured && !halt_in && !in_flow && !in_stop && !in_acknow && in_nsent <: in_limit && in_nsent
+                    != IN_BUFS as 5 && in_ready[in_ack + in_nsent[3:0]] {
+                    send     = 1;
+                    s_is_dp  = 1;
+                    s_ept    = 1;
+                    s_seq    = seq_in + in_nsent;
+                    dbg_ev   = (seq_in + in_nsent) != dbg_nseq; // (debug) a SeqNum skipped or repeated
+                    dbg_stb  = 1;
+                    dbg_nseq = seq_in + in_nsent + 5'd1;
+                    s_dlen   = {5'h0, in_len[in_ack + in_nsent[3:0]]};
+                    // EOB stays 0: an xHC takes EOB = 1 as "no more data" and then waits for an ERDY
+                    // before it asks again (the next read never started). A short packet / ZLP ends
+                    // the host's transfer, though: nothing more goes out until the host has
+                    // acknowledged it (in_stop; it drops packets sent after it, which used to leave us
+                    // a burst ahead, and ACKs of earlier packets must not restart the burst)
+                    s_eob = 0;
+                    if in_len[in_ack + in_nsent[3:0]] != 11'd1024 {
+                        in_stop = 1;
+                    }
+                    s_dpp    = 1;
+                    s_len    = in_len[in_ack + in_nsent[3:0]];
+                    s_base   = {1'b0, in_ack + in_nsent[3:0], 8'h0};
+                    in_nsent = in_nsent + 1;
+                } else if in_flow && in_ready[in_ack] && in_nsent == 0 {
+                    send    = 1;
+                    s_is_dp = 0;
+                    s_sub   = SUB_ERDY;
+                    s_dir   = 1;
+                    s_ept   = 1;
+                    s_nump  = 1;
+                    s_seq   = 0;
+                    s_rty   = 0;
+                    in_flow = 0;
+                } else if out_flow && !out_full {
+                    send     = 1;
+                    s_is_dp  = 0;
+                    s_sub    = SUB_ERDY;
+                    s_dir    = 0;
+                    s_ept    = 1;
+                    s_nump   = 1;
+                    s_seq    = 0;
+                    s_rty    = 0;
+                    out_flow = 0;
+                }
+            }
+
+            // ---- SETUP processing: one clock to register the decode, one to act
+            if setup_pend {
+                setup_pend  = 0;
+                setup_go    = 1;
+                r_desc_addr = desc_addr;
+                r_desc_ok   = desc_ok;
+                r_len_desc  = min_len(desc_len, w_length);
+                r_zlp_desc  = ({5'b0, desc_len} <: w_length) && desc_len[8:0] == 0;
+                r_len1      = min_len(1, w_length);
+                r_len2      = min_len(2, w_length);
+                r_len4      = min_len(4, w_length);
+                r_len_msos  = min_len(MSOS_LEN, w_length);
+            }
+            if setup_go {
+                var req_in     : logic   ;
+                var req_type   : logic<2>;
+                var req_rcpt   : logic<5>;
+                setup_go    = 0;
+                req_in      = bm_req[7];
+                req_type    = bm_req[6:5];
+                req_rcpt    = bm_req[4:0];
+                ctrl        = Ctrl::Stall;
+                ctrl_seq    = 0;
+                ctrl_zlp    = 0;
+                ctrl_remain = 0;
+                if req_type == 2'b00 {
+                    case b_req {
+                        8'h00: { // GET_STATUS
+                            if req_in && w_length == 2 {
+                                small_r = 0;
+                                if req_rcpt == 2 && w_index[3:0] == 1 {
+                                    small_r[0] = if w_index[7] ? halt_in : halt_out;
+                                }
+                                ctrl_base   = SMALL_ADDR as 13;
+                                ctrl_remain = 2;
+                                ctrl        = Ctrl::DataIn;
+                            }
+                        }
+                        8'h01, 8'h03: { // CLEAR_FEATURE / SET_FEATURE
+                            if req_rcpt == 2 && w_value == 0 && w_index[3:0] == 1 {
+                                if w_index[7] {
+                                    halt_in = b_req == 8'h03;
+                                    if b_req == 8'h01 {
+                                        seq_in   = 0;
+                                        dbg_nseq = 0;
+                                    }
+                                } else {
+                                    halt_out = b_req == 8'h03;
+                                    if b_req == 8'h01 {
+                                        seq_out = 0;
+                                    }
+                                }
+                                ctrl = Ctrl::Status;
+                            } else if req_rcpt == 0
+                                && (w_value == 1 || w_value == 48 || w_value == 49 || w_value == 50) {
+                                ctrl = Ctrl::Status; // REMOTE_WAKEUP / U1_ENABLE / U2_ENABLE / LTM_ENABLE: accepted
+                            } else if req_rcpt == 2 && w_value == 0 && w_index[3:0] == 0 {
+                                ctrl = Ctrl::Status; // EP0 halt: accepted, no effect
+                            }
+                        }
+                        8'h05: { // SET_ADDRESS
+                            addr_pend  = w_value[6:0];
+                            addr_apply = 1;
+                            ctrl       = Ctrl::Status;
+                        }
+                        8'h06: { // GET_DESCRIPTOR
+                            if req_in && r_desc_ok {
+                                ctrl_base   = r_desc_addr;
+                                ctrl_remain = r_len_desc;
+                                ctrl_zlp    = r_zlp_desc;
+                                ctrl        = if w_length == 0 ? Ctrl::Status : Ctrl::DataIn;
+                            }
+                        }
+                        8'h08: { // GET_CONFIGURATION
+                            if req_in {
+                                small_r     = {31'b0, configured};
+                                ctrl_base   = SMALL_ADDR as 13;
+                                ctrl_remain = r_len1;
+                                ctrl        = if w_length == 0 ? Ctrl::Status : Ctrl::DataIn;
+                            }
+                        }
+                        8'h09: { // SET_CONFIGURATION
+                            if w_value[7:0] <= 1 {
+                                configured  = w_value[0];
+                                halt_in     = 0;
+                                halt_out    = 0;
+                                seq_in      = 0;
+                                dbg_nseq    = 0;
+                                seq_out     = 0;
+                                in_wptr     = 0;
+                                in_ready    = 0;
+                                in_fill     = 0;
+                                in_ack      = 0;
+                                in_flow     = 0;
+                                in_nsent    = 0;
+                                in_limit    = 0;
+                                in_stop     = 0;
+                                in_zlp_pend = 0;
+                                out_full    = 0;
+                                out_flow    = 0;
+                                out_qv      = 0;
+                                ctrl        = Ctrl::Status;
+                            }
+                        }
+                        8'h0A: { // GET_INTERFACE
+                            if req_in && configured && w_index[7:0] == 0 {
+                                small_r     = 0;
+                                ctrl_base   = SMALL_ADDR as 13;
+                                ctrl_remain = r_len1;
+                                ctrl        = if w_length == 0 ? Ctrl::Status : Ctrl::DataIn;
+                            }
+                        }
+                        8'h0B: { // SET_INTERFACE
+                            if configured && w_index[7:0] == 0 && w_value[7:0] == 0 {
+                                seq_in   = 0;
+                                dbg_nseq = 0;
+                                seq_out  = 0;
+                                ctrl     = Ctrl::Status;
+                            }
+                        }
+                        8'h30: { // SET_SEL: 6 bytes OUT, discarded
+                            if !req_in && w_length == 6 {
+                                ctrl = Ctrl::DataOut;
+                            }
+                        }
+                        8'h31: { // SET_ISOCH_DELAY
+                            if !req_in && w_length == 0 {
+                                ctrl = Ctrl::Status;
+                            }
+                        }
+                        default: {}
+                    }
+                } else if req_type == 2'b10 {
+                    case b_req {
+                        8'h01: { // vendor IN: status word
+                            if req_in {
+                                small_r     = i_vendor_status;
+                                ctrl_base   = SMALL_ADDR as 13;
+                                ctrl_remain = r_len4;
+                                ctrl        = if w_length == 0 ? Ctrl::Status : Ctrl::DataIn;
+                            }
+                        }
+                        8'h02: { // vendor OUT: scratch register
+                            if !req_in && w_length == 0 {
+                                vendor_reg = w_value;
+                                ctrl       = Ctrl::Status;
+                            }
+                        }
+                        8'h03: { // vendor OUT: register write
+                            if !req_in && w_length == 0 {
+                                reg_wr = 1;
+                                ctrl   = Ctrl::Status;
+                            }
+                        }
+                        8'h04: { // vendor IN: register read
+                            if req_in {
+                                small_r     = i_reg_rdata;
+                                ctrl_base   = SMALL_ADDR as 13;
+                                ctrl_remain = r_len4;
+                                ctrl        = if w_length == 0 ? Ctrl::Status : Ctrl::DataIn;
+                            }
+                        }
+                        MS_VENDOR_CODE: { // MS OS 2.0 descriptor set
+                            if req_in && w_index == 7 {
+                                ctrl_base   = MSOS_ADDR;
+                                ctrl_remain = r_len_msos;
+                                ctrl_zlp    = 0;
+                                ctrl        = if w_length == 0 ? Ctrl::Status : Ctrl::DataIn;
+                            }
+                        }
+                        default: {}
+                    }
+                }
+                // a request with no data stage goes straight to the status stage;
+                // a DataIn request with nothing to send as well
+                if ctrl == Ctrl::DataIn && ctrl_remain == 0 && !ctrl_zlp {
+                    ctrl = Ctrl::Status;
+                }
+            }
+
+            // ---- hand the request to the link. A response produced while the slot is busy (an
+            // EP1 IN burst keeps it busy) waits in rq instead of being dropped: losing the ACK of
+            // an EP1 OUT packet made the host fail the transfer.
+            var s_pack: logic<70>;
+            var ld    : logic    ;
+            var ld_v  : logic<70>;
+            s_pack = {
+                dev_addr, s_is_dp, s_sub, s_dir, s_ept, s_nump, s_seq, s_rty, s_eob, s_dlen, s_dpp, s_len, s_base
+            }; // dev_addr: before this clock's update (old address for SET_ADDRESS)
+            ld     = 0;
+            ld_v   = s_pack;
+            if !tx_valid {
+                if rq_n == 0 {
+                    ld = send;
+                } else {
+                    ld   = 1;
+                    ld_v = rq[0];
+                    if rq_n == 2 {
+                        rq[0] = rq[1];
+                        if send {
+                            rq[1] = s_pack;
+                        } else {
+                            rq_n = 1;
+                        }
+                    } else if send {
+                        rq[0] = s_pack;
+                    } else {
+                        rq_n = 0;
+                    }
+                }
+            } else if send {
+                if rq_n == 0 {
+                    rq[0] = s_pack;
+                    rq_n  = 1;
+                } else if rq_n == 1 {
+                    rq[1] = s_pack;
+                    rq_n  = 2;
+                } else {
+                    dbg_ev = 1; // dropped (responses are >= 5 clocks apart, should not happen)
+                }
+            }
+            if ld {
+                tx_valid = 1;
+                tx_addr  = ld_v[69:63];
+                tx_is_dp = ld_v[62];
+                tx_sub   = ld_v[61:58];
+                tx_dir   = ld_v[57];
+                tx_ept   = ld_v[56:53];
+                tx_nump  = ld_v[52:48];
+                tx_seq   = ld_v[47:43];
+                tx_rty   = ld_v[42];
+                tx_eob   = ld_v[41];
+                tx_dlen  = ld_v[40:25];
+                tx_dpp   = ld_v[24];
+                tx_len   = ld_v[23:13];
+                tx_base  = ld_v[12:0];
+            }
+        }
+    }
+}
