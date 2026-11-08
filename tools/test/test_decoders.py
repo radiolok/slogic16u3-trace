@@ -24,6 +24,15 @@ class Tpiu(unittest.TestCase):
             self.assertEqual(vals[0], 0x12345670)
             self.assertEqual(tp.gaps_of(vals), [])
 
+    def test_narrow_port(self):
+        for width in (1, 2):  # TPIU drives TRACED0 (..1); the unused lanes carry junk
+            nibs = [x | (0xA if i % 3 else 0x4) & ~((1 << width) - 1) & 0xF
+                    for i, x in enumerate([1] * 5 + tp.encode(nvals=64, width=width))]
+            off, data, st = tp.tpiu(tp.nibbles(words_of(nibs)), width)
+            vals, _ = tp.itm(bytes(data[1]))
+            self.assertEqual(len(vals), 64, width)
+            self.assertEqual(tp.gaps_of(vals), [])
+
     def test_itm_packets(self):
         b = bytes([0, 0, 0, 0, 0, 0x80, 0x03, 0x78, 0x56, 0x34, 0x12, 0x70, 0x09, 0xAB])
         vals, st = tp.itm(b)

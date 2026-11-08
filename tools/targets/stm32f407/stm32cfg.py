@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Set the trace mode of the STM32F407 demo firmware (main.c) through OpenOCD and the on-board ST-LINK.
+"""Set the trace mode of the STM32F407 demo firmware (main.c) through OpenOCD and the on-board ST-LINK
+(or any other probe: --openocd-cfg).
 
 At HCLK of tens of kHz ST-LINK cannot stay connected to a running core, so the mode is written to RAM with the
 core held in reset (connect_assert_srst); the firmware reads it at start.
@@ -31,6 +32,8 @@ def main():
     ap.add_argument("--n0", type=lambda x: int(x, 0), help="ITM counter start value (default: continue)")
     ap.add_argument("--ospeed", type=int, default=3, help="trace pin slew rate, OSPEEDR 0..3")
     ap.add_argument("--etm", type=int, default=1, help="1: ETM instruction trace (ID 2)")
+    ap.add_argument("-f", "--openocd-cfg", default="board/stm32f4discovery.cfg",
+                    help="OpenOCD config with the probe and the target (default: on-board ST-LINK)")
     a = ap.parse_args()
     words = [CFG_MAGIC, 0, SRC[a.src], a.pll_n, a.hdiv, a.width, a.burst, a.idle]
     extra = f"write_memory {CFG_ADDR + 0x2C:#x} 32 {a.n0:#x}; " if a.n0 is not None else ""
@@ -38,13 +41,13 @@ def main():
     cmd = ("init; reset halt; "
            f"write_memory {CFG_ADDR:#x} 32 {{{' '.join(hex(w) for w in words)}}}; " + extra +
            f"puts \"CFG [read_memory {CFG_ADDR:#x} 32 16]\"; resume; shutdown")
-    r = subprocess.run([OPENOCD, "-f", "board/stm32f4discovery.cfg",
+    r = subprocess.run([OPENOCD, "-f", a.openocd_cfg,
                         "-c", "reset_config srst_only srst_nogate connect_assert_srst", "-c", cmd],
                        capture_output=True, text=True, timeout=60)
     out = r.stdout + r.stderr
     m = re.search(r"^CFG (.*)$", out, re.M)
     if not m:
-        sys.exit("no answer from ST-LINK\n" + out[-1500:])
+        sys.exit("no answer from the probe\n" + out[-1500:])
     v = [int(x, 16) for x in m[1].split()]
     print(f"previous run: hclk {v[9]} Hz, err {v[10]}, values sent {v[11]}, trace re-applied {v[12]}, "
           f"ETMIDR {v[15]:08x}")

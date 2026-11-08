@@ -2,10 +2,12 @@
 """ARM TPIU decoder for usb3d captures: formatter frames -> ITM and ETMv3 (Cortex-M3/M4).
 
 Input: a capture from `usb3d.py cap` (.bin, little-endian 32-bit words) or a testbench dump (.hex, a word per
-line). Each byte of a word is one TRACECLK cycle, low nibble first, i.e. a 4-bit TPIU port stream.
+line). Each byte of a word is one TRACECLK cycle, low nibble first, i.e. a 4-bit TPIU port stream. A 1- or
+2-bit port (--width) uses the low lanes of each nibble: TRACED0, or TRACED0..1; the other lanes are ignored.
 
     tpiu_decode.py decode run.bin                       # TPIU sync, frames, ITM stimulus port 0 counter check
     tpiu_decode.py show run.bin --elf fw.elf -o out.txt # ITM and ETM packets, executed instructions
+    tpiu_decode.py decode run.bin --width 2             # 2-bit port (TRACED0..1)
     tpiu_decode.py encode --out stream.hex              # synthetic stream (ITM counter) for rtl/sim/tb_tpiu.v
 
 ETM decoding follows the rules of OpenCSD (decoder/source/etmv3): a P-header atom is one instruction
@@ -392,7 +394,7 @@ def func_of(dis, addr):
 def cmd_decode(a):
     words = load(a.file, a.words, a.skip)
     samples = remap(nibbles(words), a.lanes)
-    off, data, st = tpiu(samples, 4)
+    off, data, st = tpiu(samples, a.width)
     print(f"{len(words)} words = {len(samples)} nibbles")
     if off is None:
         print("no TPIU sync (FF 7F) found; first nibbles:", "".join(f"{s:x}" for s in samples[:128]))
@@ -416,7 +418,7 @@ def cmd_decode(a):
 def cmd_show(a):
     words = load(a.file, a.words, a.skip)
     samples = remap(nibbles(words), a.lanes)
-    off, data, st = tpiu(samples, 4)
+    off, data, st = tpiu(samples, a.width)
     lines = []
     w = lines.append
     w(f"{len(words)} words = {len(samples)} nibbles")
@@ -517,6 +519,7 @@ def main():
         p.add_argument("--words", type=int, default=1 << 18, help="words to decode (0 = all)")
         p.add_argument("--skip", type=int, default=0, help="words to skip from the start")
         p.add_argument("--lanes", default="0123", help="lane order: bit i = TRACED<lanes[i]>")
+        p.add_argument("--width", type=int, default=4, choices=(1, 2, 4), help="trace port width, bits")
     p = sub.choices["decode"]
     p.add_argument("--expect", type=int, help="fail unless exactly this many ITM values are decoded")
     p.set_defaults(fn=cmd_decode)

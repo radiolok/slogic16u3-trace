@@ -139,7 +139,8 @@ then drives the target at its VREF. Return lines (TDO, SWO) come into CH inputs 
 - [ ] TRACECLK above 50 MHz over USB 3.0 (adapter instead of loose wires)
 - [ ] Capture without host pauses (WinUSB with RAW_IO, or Linux)
 - [ ] IODELAY sweep tool on usb3d
-- [ ] 1- and 2-bit port modes
+- [x] 1- and 2-bit port modes: decoded on the PC (`tpiu_decode.py --width`); the stream still carries all 4 lanes
+- [ ] 1- and 2-bit packing in the FPGA (2-4x less USB bandwidth)
 - [ ] Bridge to Orbuculum and OpenCSD
 - [ ] Target JTAG/SWD (see above)
 
