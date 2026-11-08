@@ -178,9 +178,10 @@ static void apply_trace(void)
     CFG->reinit++;
 }
 
+// ITM_TCR bit 23 is BUSY: set while ITM has data in flight, e.g. most of the time on a slow SWO
 static int trace_ok(void)
 {
-    return ITM_TCR == ITM_TCR_VAL && ITM_TER == 1 && (DEMCR & 1u << 24) && (DBGMCU_CR & 1u << 5) &&
+    return (ITM_TCR & ~(1u << 23)) == ITM_TCR_VAL && ITM_TER == 1 && (DEMCR & 1u << 24) && (DBGMCU_CR & 1u << 5) &&
            (CFG->etm != 1 || (ETM_CR & (1u << 11 | 1u << 10 | 1u)) == 1u << 11);
 }
 
